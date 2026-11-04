@@ -724,7 +724,7 @@ func init() {
 	flag.BoolVar(&cliops.setuser, "set-user", cliops.setuser, "set R-URI user to To-URI user for destination proxy address")
 	flag.BoolVar(&cliops.setuser, "su", cliops.setuser, "set R-URI user to To-URI user for destination proxy address")
 	flag.BoolVar(&cliops.subscribe, "subscribe", cliops.subscribe, "set method to SUBSCRIBE")
-	flag.BoolVar(&cliops.subscribesession, "subscribe-session", cliops.subscribesession, "set method to SUBSCRIBE and wait for NOTIFY requests for sessionwait interval")
+	flag.BoolVar(&cliops.subscribesession, "subscribe-session", cliops.subscribesession, "set method to SUBSCRIBE and wait for NOTIFY requests for sessionwait interval, refreshing before expires")
 	flag.BoolVar(&cliops.templatedefaults, "template-defaults", cliops.templatedefaults, "print default (internal) template data")
 	flag.BoolVar(&cliops.templatedefaults, "tpd", cliops.templatedefaults, "print default (internal) template data")
 	flag.BoolVar(&cliops.templaterun, "template-run", cliops.templaterun, "run template execution and print the result")
@@ -2999,6 +2999,39 @@ func SIPExerDialogSetLastRequest(seDlg *SIPExerDialog, smsg string) int {
 	return SIPExerRetOK
 }
 
+// SIPExerSubscribeRefresh turns the last SUBSCRIBE into an in-dialog refresh
+func SIPExerSubscribeRefresh(seDlg *SIPExerDialog, smsg *string) int {
+	var hv string
+	sgsip.SGSIPMessageHeaderGet(seDlg.FirstRequest, "To", &hv)
+	if !strings.Contains(hv, ";tag=") {
+		// the dialog-creating 2xx gives the To-tag and the route set
+		sgsip.SGSIPMessageHeaderGet(seDlg.LastResponse, "To", &hv)
+		sgsip.SGSIPMessageHeaderSet(seDlg.FirstRequest, "To", hv)
+		var rts []string
+		for _, h := range seDlg.LastResponse.Headers {
+			if h.HType == sgsip.HeaderTypeRecordRoute {
+				for _, r := range strings.Split(h.Body, ",") {
+					rts = append([]string{strings.TrimSpace(r)}, rts...)
+				}
+			}
+		}
+		if len(rts) > 0 {
+			sgsip.SGSIPMessageHeaderSet(seDlg.FirstRequest, "Route", strings.Join(rts, ", "))
+		}
+	}
+	if sgsip.SGSIPMessageGetContactURI(seDlg.LastResponse, &hv) == sgsip.SGSIPRetOK {
+		seDlg.FirstRequest.FLine.URI = hv
+		seDlg.FirstRequest.FLine.Val = "SUBSCRIBE " + hv + " SIP/2.0"
+	}
+	sgsip.SGSIPMessageViaUpdate(seDlg.FirstRequest)
+	sgsip.SGSIPMessageCSeqUpdate(seDlg.FirstRequest, 1)
+	if sgsip.SGSIPMessageToString(seDlg.FirstRequest, smsg) != sgsip.SGSIPRetOK {
+		SIPExerPrintf(SIPExerLogError, "failed to build sip subscribe refresh\n")
+		return SIPExerErrSIPMessageToString
+	}
+	return SIPExerRetOK
+}
+
 func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDialog) int {
 	var smsg string = ""
 	var sack string = ""
@@ -3430,9 +3463,19 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 			}
 			if seDlg.SessionWait > 0 && ret >= 200 && ret < 300 &&
 				(cliops.invite || cliops.register || cliops.subscribesession) {
+				swLeft := 0
+				if cliops.subscribesession {
+					var hv string
+					sgsip.SGSIPMessageHeaderGet(seDlg.LastResponse, "Expires", &hv)
+					// refresh at 90% of the granted expires while the session wait lasts
+					if exp, err := strconv.Atoi(hv); err == nil && exp > 0 && exp*900 < seDlg.SessionWait {
+						swLeft = seDlg.SessionWait - exp*900
+						seDlg.SessionWait = exp * 900
+					}
+				}
 				SIPExerSessionWaitAndRead(seDlg)
 				smsg = ""
-				seDlg.SessionWait = 0
+				seDlg.SessionWait = swLeft
 				if cliops.register {
 					sgsip.SGSIPMessageViaUpdate(seDlg.FirstRequest)
 					sgsip.SGSIPMessageCSeqUpdate(seDlg.FirstRequest, 1)
@@ -3455,8 +3498,13 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 						return lret
 					}
 				} else if cliops.subscribesession {
-					// subscribe-session mode ends after waiting for NOTIFY handling
-					return ret
+					if swLeft == 0 {
+						// subscribe-session mode ends after waiting for NOTIFY handling
+						return ret
+					}
+					if lret := SIPExerSubscribeRefresh(seDlg, &smsg); lret < 0 {
+						return lret
+					}
 				}
 				if len(smsg) > 0 {
 					// send the new message

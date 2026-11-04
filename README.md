@@ -326,7 +326,7 @@ sipexer --call-user --ring-time 2000 --call-duration 10000 \
 ```
 
 Send `SUBSCRIBE`, then keep the session open for `--sessionwait` to receive
-`NOTIFY` and auto-reply `200 OK`:
+`NOTIFY` and auto-reply `200 OK`, refreshing it in-dialog at 90% of the granted expires:
 
 ```shell
 sipexer --subscribe-session --sessionwait 15000 -ex 60 -xh "Event:presence" \
