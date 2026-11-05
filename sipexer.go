@@ -225,6 +225,11 @@ type SIPExerDialog struct {
 	TargetAFProto  string
 	InitConnUDP    *net.UDPConn
 	InDialogReq    []byte
+
+	LastReply    string
+	LastErr      string
+	Resubscribes int
+	SessionEnd   time.Time
 }
 
 type paramFieldsType map[string]string
@@ -2644,6 +2649,7 @@ func SIPExerSetReadTimeoutValue(seDlg *SIPExerDialog, tVal int) int {
 		err = seDlg.ConnUDP.Conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(tVal)))
 		if err != nil {
 			SIPExerPrintf(SIPExerLogError, "error: %v\n", err)
+			seDlg.LastErr = err.Error()
 			return SIPExerErrUDPSetTimeout
 		}
 	} else if seDlg.ProtoId == sgsip.ProtoTCP {
@@ -2946,6 +2952,7 @@ func SIPExerSendBytes(seDlg *SIPExerDialog, bmsg []byte) int {
 		}
 		if err != nil {
 			SIPExerPrintf(SIPExerLogError, "error writing on udp (connect: %v) - %v\n", cliops.connectudp, err)
+			seDlg.LastErr = err.Error()
 			return SIPExerErrUDPWrite
 		}
 	} else if seDlg.ProtoId == sgsip.ProtoTCP {
@@ -3001,6 +3008,20 @@ func SIPExerDialogSetLastRequest(seDlg *SIPExerDialog, smsg string) int {
 		return SIPExerErrSIPMessageFormat
 	}
 	return SIPExerRetOK
+}
+
+// SIPExerDiagPrintf prints a SSDIAG subscribe-session line at any verbosity
+func SIPExerDiagPrintf(format string, v ...interface{}) {
+	SIPExerPrintf(SIPExerLogNone, "SSDIAG "+time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00")+" "+format, v...)
+}
+
+// SIPExerMessageCallID returns the Call-ID of a message, empty if none
+func SIPExerMessageCallID(msg *sgsip.SGSIPMessage) string {
+	var cid string
+	if msg != nil {
+		sgsip.SGSIPMessageHeaderGet(msg, "Call-ID", &cid)
+	}
+	return cid
 }
 
 // SIPExerSubscribeRefresh turns the last SUBSCRIBE into an in-dialog refresh
@@ -3093,11 +3114,16 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 	var sessionEnd time.Time
 	// a re-subscribe after a failure is in progress
 	var resubscribing bool = false
+	// first failure of the current re-subscribe sequence
+	var resubSince time.Time
 
 	// subscribe-session: replace a failed subscription with a new one while the window lasts
 	resubscribe := func(code int) bool {
 		if !cliops.subscribesession || sessionEnd.IsZero() {
 			return false
+		}
+		if !resubscribing {
+			resubSince = time.Now()
 		}
 		if resubscribing {
 			// wait one transaction timeout between failed re-subscribes
@@ -3116,9 +3142,14 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 			SIPExerResolveDialogTarget(seDlg)
 		}
 		SIPExerPrintf(SIPExerLogInfo, "subscription failed (%d) - sending a new subscribe\n", code)
+		oldcid := SIPExerMessageCallID(seDlg.FirstRequest)
 		if SIPExerSubscribeRestart(seDlg, &smsg) < 0 {
+			seDlg.LastErr = "subscribe restart failed"
 			return false
 		}
+		seDlg.Resubscribes++
+		SIPExerDiagPrintf("resubscribe n=%d after=%d target=%s old-call-id=%s call-id=%s\n",
+			seDlg.Resubscribes, code, seDlg.TargetAddr, oldcid, SIPExerMessageCallID(seDlg.FirstRequest))
 		wmsg = []byte(smsg)
 		SIPExerPrintf(SIPExerLogInfo, "sending to %s %s: [[---", seDlg.Proto, seDlg.TargetAddr)
 		SIPExerMessagePrint("\n\n", smsg, "\n")
@@ -3233,7 +3264,7 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 					continue
 				}
 				SIPExerPrintf(SIPExerLogError, "error reading - bytes %d - %v\n", seDlg.RecvN, err)
-				if resubscribe(408) {
+				if resubscribe(SIPExerErrUDPReceiveTimeout) {
 					continue
 				}
 				return SIPExerErrUDPReceiveTimeout
@@ -3258,8 +3289,13 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 				seDlg.RecvBuf = make([]byte, cliops.buffersize)
 				continue
 			}
+			rline, _, _ := bytes.Cut(seDlg.RecvBuf[:seDlg.RecvN], []byte("\r\n"))
+			if bytes.HasPrefix(rline, []byte("SIP/2.0 ")) {
+				seDlg.LastReply = string(rline)
+			}
 			ret = SIPExerProcessResponse(reqMsg, seDlg.RecvBuf[:seDlg.RecvN], seDlg.LastResponse, &seDlg.SkipAuth, &smsg, &sack, seDlg.AuthUser, seDlg.AuthPassword)
 			if ret < 0 {
+				seDlg.LastErr = "failed to process: " + string(rline)
 				return ret
 			}
 			if seDlg.LastResponse.FLine.MType == sgsip.FLineResponse {
@@ -3561,6 +3597,13 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 			if cliops.subscribesession && ret >= 200 && ret < 300 {
 				if sessionEnd.IsZero() {
 					sessionEnd = time.Now().Add(time.Duration(cliops.sessionwait) * time.Millisecond)
+					seDlg.SessionEnd = sessionEnd
+					SIPExerDiagPrintf("established target=%s call-id=%s\n",
+						seDlg.TargetAddr, SIPExerMessageCallID(seDlg.FirstRequest))
+				}
+				if resubscribing {
+					SIPExerDiagPrintf("resubscribed n=%d took=%ds target=%s call-id=%s\n", seDlg.Resubscribes,
+						int(time.Since(resubSince).Seconds()), seDlg.TargetAddr, SIPExerMessageCallID(seDlg.FirstRequest))
 				}
 				// refreshes and re-subscribes share the window started by the first 2xx
 				seDlg.SessionWait = int(time.Until(sessionEnd).Milliseconds())
@@ -3676,7 +3719,17 @@ func SIPExerSendUDP(dstSockAddr sgsip.SGSIPSocketAddress, tplstr string, tplfiel
 		return
 	}
 	defer SIPExerDialogCloseConn(&seDlg)
+	tStart := time.Now()
 	ret = SIPExerDialogLoop(tplstr, tplfields, &seDlg)
+	if cliops.subscribesession {
+		wleft := "none"
+		if !seDlg.SessionEnd.IsZero() {
+			wleft = strconv.Itoa(int(time.Until(seDlg.SessionEnd).Seconds())) + "s"
+		}
+		SIPExerDiagPrintf("ended code=%d age=%ds window-left=%s resubscribes=%d state=%d target=%s last-reply=%q last-err=%q call-id=%s\n",
+			ret, int(time.Since(tStart).Seconds()), wleft, seDlg.Resubscribes, seDlg.State, seDlg.TargetAddr,
+			seDlg.LastReply, seDlg.LastErr, SIPExerMessageCallID(seDlg.FirstRequest))
+	}
 	tchan <- ret
 }
 
