@@ -387,6 +387,7 @@ type CLIOptions struct {
 	helpcommands     bool
 	dnssrvprint      bool
 	indialogdns      bool
+	indialogdnsauth  bool
 	indialogsocket   bool
 	lateoffer        bool
 	akauser          string
@@ -492,6 +493,7 @@ var cliops = CLIOptions{
 	runbatchinterval: 1000,
 	dnssrvprint:      false,
 	indialogdns:      false,
+	indialogdnsauth:  false,
 	indialogsocket:   false,
 	lateoffer:        false,
 	helpcommands:     false,
@@ -689,6 +691,8 @@ func init() {
 	flag.BoolVar(&cliops.dnssrvprint, "dns-srv-print", cliops.dnssrvprint, "print DNS SRV records")
 	flag.BoolVar(&cliops.indialogdns, "in-dialog-dns", cliops.indialogdns, "re-resolve FQDN target via DNS before each in-dialog request (UDP only)")
 	flag.BoolVar(&cliops.indialogdns, "idd", cliops.indialogdns, "re-resolve FQDN target via DNS before each in-dialog request (UDP only)")
+	flag.BoolVar(&cliops.indialogdnsauth, "in-dialog-dns-auth", cliops.indialogdnsauth, "re-resolve FQDN target via DNS before the request with credentials after a 401/407 (UDP only)")
+	flag.BoolVar(&cliops.indialogdnsauth, "idda", cliops.indialogdnsauth, "re-resolve FQDN target via DNS before the request with credentials after a 401/407 (UDP only)")
 	flag.BoolVar(&cliops.indialogsocket, "in-dialog-socket", cliops.indialogsocket, "send each in-dialog request from a new local socket (UDP only)")
 	flag.BoolVar(&cliops.indialogsocket, "ids", cliops.indialogsocket, "send each in-dialog request from a new local socket (UDP only)")
 	flag.BoolVar(&cliops.fieldseval, "fe", cliops.fieldseval, "evaluate expression in fields file")
@@ -3632,6 +3636,9 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 						return ret
 					}
 					// authentication - send the new message
+					if cliops.indialogdnsauth {
+						SIPExerResolveDialogTarget(seDlg)
+					}
 					wmsg = []byte(smsg)
 					SIPExerPrintf(SIPExerLogInfo, "sending to %s %s: [[---", seDlg.Proto, seDlg.TargetAddr)
 					SIPExerMessagePrint("\n\n", smsg, "\n")
