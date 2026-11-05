@@ -336,6 +336,24 @@ sipexer --subscribe-session --sessionwait 15000 -ex 60 -xh "Event:presence" \
   --fuser alice -cb -sd -su tcp:server.com:5060
 ```
 
+Phone-like behaviour for presence load tests:
+
+- `-failover <ms>` (UDP, FQDN target): after this many ms without a final reply, send a copy
+  of the request with a new Via branch to the next IP of the target name, as phones do when a
+  sipproxy does not answer (`-failover-max`, default 2 copies). Phones use about 3500.
+- `423 Interval Too Brief`: the SUBSCRIBE is sent again at once with the `Min-Expires` value.
+- `Retry-After` on an error reply is honoured before the next new `SUBSCRIBE`.
+- `-notify-drop-pct <n>`: that percent of subscribe sessions never answer `NOTIFY`, like
+  phones behind a dead NAT mapping.
+
+Example against a QA pod, many devices from a credentials file (password column in HA1):
+
+```shell
+sipexer --subscribe-session -sw 1800000 -ex 600 -cb -ha1 -acsv users.csv \
+  -xh 'Event: dialog' -tuser 101 -ruser 101 -fd sip.t2-n6071.qa.n2p.io -td sip.t2-n6071.qa.n2p.io \
+  -failover 3500 -notify-drop-pct 2 -rc 30000 -rb 200 -rbi 1000
+```
+
 To remove the default value for implicit fields (e.g., `useragent`), the `-no-val` value can
 be provided (which is default `no`), like:
 

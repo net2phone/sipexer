@@ -230,6 +230,11 @@ type SIPExerDialog struct {
 	LastErr      string
 	Resubscribes int
 	SessionEnd   time.Time
+
+	Failovers       int
+	FailoverLastVal int
+	FailoverIPs     []string
+	DropNotify      bool
 }
 
 type paramFieldsType map[string]string
@@ -393,6 +398,9 @@ type CLIOptions struct {
 	dnssrvprint      bool
 	indialogdns      bool
 	indialogdnsauth  bool
+	failover         int
+	failovermax      int
+	notifydroppct    float64
 	indialogsocket   bool
 	lateoffer        bool
 	akauser          string
@@ -499,6 +507,9 @@ var cliops = CLIOptions{
 	dnssrvprint:      false,
 	indialogdns:      false,
 	indialogdnsauth:  false,
+	failover:         0,
+	failovermax:      2,
+	notifydroppct:    0,
 	indialogsocket:   false,
 	lateoffer:        false,
 	helpcommands:     false,
@@ -698,6 +709,9 @@ func init() {
 	flag.BoolVar(&cliops.indialogdns, "idd", cliops.indialogdns, "re-resolve FQDN target via DNS before each in-dialog request (UDP only)")
 	flag.BoolVar(&cliops.indialogdnsauth, "in-dialog-dns-auth", cliops.indialogdnsauth, "re-resolve FQDN target via DNS before the request with credentials after a 401/407 (UDP only)")
 	flag.BoolVar(&cliops.indialogdnsauth, "idda", cliops.indialogdnsauth, "re-resolve FQDN target via DNS before the request with credentials after a 401/407 (UDP only)")
+	flag.IntVar(&cliops.failover, "failover", cliops.failover, "UDP: after this many ms without a final reply, send a copy (new Via branch) to the next IP of the FQDN target, like phones failing over to the next sipproxy (0 = off)")
+	flag.IntVar(&cliops.failovermax, "failover-max", cliops.failovermax, "maximum fail-over copies per transaction")
+	flag.Float64Var(&cliops.notifydroppct, "notify-drop-pct", cliops.notifydroppct, "subscribe-session: percent of dialogs that never answer NOTIFY (phones behind a dead NAT)")
 	flag.BoolVar(&cliops.indialogsocket, "in-dialog-socket", cliops.indialogsocket, "send each in-dialog request from a new local socket (UDP only)")
 	flag.BoolVar(&cliops.indialogsocket, "ids", cliops.indialogsocket, "send each in-dialog request from a new local socket (UDP only)")
 	flag.BoolVar(&cliops.fieldseval, "fe", cliops.fieldseval, "evaluate expression in fields file")
@@ -2747,6 +2761,10 @@ func SIPExerSessionWaitAndRead(seDlg *SIPExerDialog) int {
 								return SIPExerErrSIPMessageToString
 							}
 						} else {
+							if seDlg.DropNotify && sipRcv.FLine.MethodId == sgsip.SIPMethodNOTIFY {
+								SIPExerPrintf(SIPExerLogInfo, "notify-drop: not answering NOTIFY (dead NAT)\n")
+								continue
+							}
 							if sgsip.SGSIPMessageToResponseString(&sipRcv, "200", "OK", &smsg) != sgsip.SGSIPRetOK {
 								SIPExerPrintf(SIPExerLogError, "failed to build sip response\n")
 								return SIPExerErrSIPMessageToString
@@ -2886,6 +2904,58 @@ func SIPExerResolveDialogTarget(seDlg *SIPExerDialog) int {
 	seDlg.ConnUDP.DstAddr = dstAddr
 	seDlg.TargetAddr = newTarget
 	return SIPExerRetOK
+}
+
+// SIPExerFailoverTarget points the dialog at the next IP of its FQDN target (UDP only).
+// Phones do this when a sipproxy does not answer: the copy goes out with a new Via branch,
+// so every proxy forwards and retransmits its own copy to the next hop.
+func SIPExerFailoverTarget(seDlg *SIPExerDialog) bool {
+	if seDlg.ProtoId != sgsip.ProtoUDP || cliops.connectudp || len(seDlg.TargetHostPort) == 0 {
+		return false
+	}
+	host, port, err := net.SplitHostPort(seDlg.TargetHostPort)
+	if err != nil || net.ParseIP(host) != nil {
+		return false
+	}
+	if len(seDlg.FailoverIPs) == 0 {
+		ips, lerr := net.LookupHost(host)
+		if lerr != nil || len(ips) < 2 {
+			return false
+		}
+		sort.Strings(ips)
+		seDlg.FailoverIPs = ips
+	}
+	cur, _, _ := net.SplitHostPort(seDlg.TargetAddr)
+	idx := 0
+	for i, ip := range seDlg.FailoverIPs {
+		if ip == cur {
+			idx = i
+			break
+		}
+	}
+	next := seDlg.FailoverIPs[(idx+1)%len(seDlg.FailoverIPs)]
+	dstAddr, err := net.ResolveUDPAddr(seDlg.TargetAFProto, net.JoinHostPort(next, port))
+	if err != nil {
+		return false
+	}
+	SIPExerPrintf(SIPExerLogInfo, "failover: no final reply from %s - next copy to %s\n", seDlg.TargetAddr, dstAddr.String())
+	seDlg.ConnUDP.DstAddr = dstAddr
+	seDlg.TargetAddr = dstAddr.String()
+	return true
+}
+
+// SIPExerNewBranch returns the message with a new Via branch (a new client transaction)
+func SIPExerNewBranch(bmsg []byte) []byte {
+	msg := sgsip.SGSIPMessage{}
+	if sgsip.SGSIPParseMessage(string(bmsg), &msg) != sgsip.SGSIPRetOK {
+		return bmsg
+	}
+	sgsip.SGSIPMessageViaUpdate(&msg)
+	var out string
+	if sgsip.SGSIPMessageToString(&msg, &out) != sgsip.SGSIPRetOK {
+		return bmsg
+	}
+	return []byte(out)
 }
 
 func SIPExerInDialogSocket(seDlg *SIPExerDialog, bmsg []byte) int {
@@ -3110,12 +3180,18 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 	var err error
 	var wmsg []byte
 	var skipsend bool = false
-	// subscribe-session window, started by the first 2xx
+	// subscribe-session window, started with the session (also bounds retries before the first 2xx)
 	var sessionEnd time.Time
+	// the first 2xx was received
+	var established bool = false
+	// Retry-After of the last error reply, in ms (0 = none)
+	var retryAfterMs int = 0
 	// a re-subscribe after a failure is in progress
 	var resubscribing bool = false
 	// first failure of the current re-subscribe sequence
 	var resubSince time.Time
+	// 423 Interval Too Brief retries of the current request
+	var retry423 int = 0
 
 	// subscribe-session: replace a failed subscription with a new one while the window lasts
 	resubscribe := func(code int) bool {
@@ -3125,15 +3201,23 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 		if !resubscribing {
 			resubSince = time.Now()
 		}
-		if resubscribing {
-			// wait one transaction timeout between failed re-subscribes
-			seDlg.SessionWait = cliops.timeout
-			if left := int(time.Until(sessionEnd).Milliseconds()); left < seDlg.SessionWait {
-				seDlg.SessionWait = left
-			}
-			if seDlg.SessionWait > 0 {
-				SIPExerSessionWaitAndRead(seDlg)
-			}
+		// like phones: a new dialog soon after 481 or a timeout, later after other errors,
+		// or after Retry-After when the server gave one
+		wait := 30000 + mathrand.Intn(60001)
+		if code == 481 || code == 408 || code == SIPExerErrUDPReceiveTimeout {
+			wait = 500 + mathrand.Intn(2501)
+		}
+		if retryAfterMs > 0 {
+			wait = retryAfterMs
+			retryAfterMs = 0
+		}
+		if left := int(time.Until(sessionEnd).Milliseconds()); left < wait {
+			wait = left
+		}
+		if wait > 0 {
+			SIPExerPrintf(SIPExerLogInfo, "subscription failed (%d) - new subscribe in %dms\n", code, wait)
+			seDlg.SessionWait = wait
+			SIPExerSessionWaitAndRead(seDlg)
 		}
 		if time.Until(sessionEnd) <= 0 {
 			return false
@@ -3177,6 +3261,8 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 
 	// per-dialog copy of sessionwait
 	seDlg.SessionWait = cliops.sessionwait
+	seDlg.DropNotify = cliops.subscribesession && cliops.notifydroppct > 0 &&
+		mathrand.Float64()*100 < cliops.notifydroppct
 
 	seDlg.FirstRequest = new(sgsip.SGSIPMessage)
 	ret := SIPExerPrepareMessage(tplstr, tplfields, seDlg.Proto, seDlg.LocalAddr, seDlg.TargetAddr, seDlg.FirstRequest)
@@ -3194,6 +3280,10 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 	wmsg = []byte(smsg)
 
 	seDlg.RecvBuf = make([]byte, cliops.buffersize)
+	if cliops.subscribesession {
+		sessionEnd = time.Now().Add(time.Duration(cliops.sessionwait) * time.Millisecond)
+		seDlg.SessionEnd = sessionEnd
+	}
 	// retransmissions loop
 	for {
 		if !skipsend && ((seDlg.ProtoId != sgsip.ProtoUDP && seDlg.State != SIPExerDialogEarly) || seDlg.Resend) {
@@ -3259,6 +3349,21 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 					seDlg.TimeoutStep = cliops.timert2
 				}
 				seDlg.TimeoutVal += seDlg.TimeoutStep
+				if cliops.failover > 0 && seDlg.TimeoutVal <= cliops.timeout {
+					if seDlg.TimeoutVal < seDlg.FailoverLastVal {
+						// a new transaction started since the last check
+						seDlg.Failovers = 0
+					}
+					seDlg.FailoverLastVal = seDlg.TimeoutVal
+					if seDlg.Failovers < cliops.failovermax && seDlg.TimeoutVal >= cliops.failover*(seDlg.Failovers+1) &&
+						SIPExerFailoverTarget(seDlg) {
+						seDlg.Failovers++
+						wmsg = SIPExerNewBranch(wmsg)
+						seDlg.TimeoutStep = cliops.timert1
+						SIPExerPrintf(SIPExerLogInfo, "failover %d - sending to %s\n", seDlg.Failovers, seDlg.TargetAddr)
+						continue
+					}
+				}
 				if seDlg.TimeoutVal <= cliops.timeout {
 					SIPExerPrintf(SIPExerLogInfo, "trying again - new timeout at %dms\n", seDlg.TimeoutVal)
 					continue
@@ -3595,9 +3700,8 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 				}
 			}
 			if cliops.subscribesession && ret >= 200 && ret < 300 {
-				if sessionEnd.IsZero() {
-					sessionEnd = time.Now().Add(time.Duration(cliops.sessionwait) * time.Millisecond)
-					seDlg.SessionEnd = sessionEnd
+				if !established {
+					established = true
 					SIPExerDiagPrintf("established target=%s call-id=%s\n",
 						seDlg.TargetAddr, SIPExerMessageCallID(seDlg.FirstRequest))
 				}
@@ -3605,7 +3709,7 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 					SIPExerDiagPrintf("resubscribed n=%d took=%ds target=%s call-id=%s\n", seDlg.Resubscribes,
 						int(time.Since(resubSince).Seconds()), seDlg.TargetAddr, SIPExerMessageCallID(seDlg.FirstRequest))
 				}
-				// refreshes and re-subscribes share the window started by the first 2xx
+				// refreshes and re-subscribes share the session window
 				seDlg.SessionWait = int(time.Until(sessionEnd).Milliseconds())
 				resubscribing = false
 			}
@@ -3695,6 +3799,35 @@ func SIPExerDialogLoop(tplstr string, tplfields map[string]any, seDlg *SIPExerDi
 					seDlg.RecvBuf = make([]byte, cliops.buffersize)
 					seDlg.State = SIPExerDialogStarted
 					continue
+				}
+				if ret == 423 && (cliops.subscribe || cliops.subscribesession) && retry423 < 3 {
+					var mexp string
+					sgsip.SGSIPMessageHeaderGet(seDlg.LastResponse, "Min-Expires", &mexp)
+					if v, cerr := strconv.Atoi(strings.TrimSpace(mexp)); cerr == nil && v > 0 {
+						sgsip.SGSIPMessageHeaderSet(seDlg.FirstRequest, "Expires", strconv.Itoa(v))
+						sgsip.SGSIPMessageViaUpdate(seDlg.FirstRequest)
+						sgsip.SGSIPMessageCSeqUpdate(seDlg.FirstRequest, 1)
+						if sgsip.SGSIPMessageToString(seDlg.FirstRequest, &smsg) == sgsip.SGSIPRetOK {
+							retry423++
+							SIPExerPrintf(SIPExerLogInfo, "423 - sending again with Expires %d\n", v)
+							wmsg = []byte(smsg)
+							if seDlg.ProtoId == sgsip.ProtoUDP {
+								seDlg.TimeoutStep = cliops.timert1
+								seDlg.TimeoutVal = seDlg.TimeoutStep
+								seDlg.Resend = true
+							}
+							seDlg.RecvBuf = make([]byte, cliops.buffersize)
+							continue
+						}
+					}
+				}
+				if ret != 481 && ret != 408 && seDlg.LastResponse != nil {
+					// other errors: the next new subscription waits as the server asks
+					var ra string
+					sgsip.SGSIPMessageHeaderGet(seDlg.LastResponse, "Retry-After", &ra)
+					if v, cerr := strconv.Atoi(strings.TrimSpace(strings.Split(ra, ";")[0])); cerr == nil && v > 0 {
+						retryAfterMs = v*1000 + mathrand.Intn(2001)
+					}
 				}
 				if resubscribe(ret) {
 					continue

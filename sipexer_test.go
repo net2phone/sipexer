@@ -1271,3 +1271,21 @@ func TestSelectDigestAuthParamsModes(t *testing.T) {
 		t.Fatalf("expected nil for non-existing requested algorithm, got: %#v", got)
 	}
 }
+
+func TestSIPExerNewBranch(t *testing.T) {
+	req := "SUBSCRIBE sip:101@example.com SIP/2.0\r\n" +
+		"Via: SIP/2.0/UDP 10.0.0.1:5060;rport;branch=z9hG4bKold123\r\n" +
+		"From: <sip:alice@example.com>;tag=a1\r\n" +
+		"To: <sip:101@example.com>\r\n" +
+		"Call-ID: c1@example.com\r\n" +
+		"CSeq: 1 SUBSCRIBE\r\n" +
+		"Content-Length: 0\r\n\r\n"
+	out := string(SIPExerNewBranch([]byte(req)))
+	if strings.Contains(out, "branch=z9hG4bKold123") {
+		t.Fatalf("branch not changed:\n%s", out)
+	}
+	if !strings.Contains(out, "branch=z9hG4bK") || !strings.Contains(out, "CSeq: 1 SUBSCRIBE") ||
+		!strings.Contains(out, "Call-ID: c1@example.com") {
+		t.Fatalf("unexpected message:\n%s", out)
+	}
+}
