@@ -327,6 +327,43 @@ func (su *SIPExerSharedUDP) readLoop() {
 	}
 }
 
+var spreadIPsMu sync.Mutex
+var spreadIPs = map[string][]string{}
+var spreadIPsNext uint64
+
+// SIPExerSpreadIP returns the next IP of an FQDN in turn (-spread-ips); the name is resolved
+// once per run and the IPs are sorted, so the order is stable; an IP or a failed lookup is
+// returned unchanged
+func SIPExerSpreadIP(afProto string, host string) string {
+	if net.ParseIP(host) != nil {
+		return host
+	}
+	spreadIPsMu.Lock()
+	ips, ok := spreadIPs[host]
+	if !ok {
+		all, err := net.LookupHost(host)
+		if err == nil {
+			for _, ip := range all {
+				pip := net.ParseIP(ip)
+				if pip == nil || (afProto == "udp4" && pip.To4() == nil) ||
+					(afProto == "udp6" && pip.To4() != nil) {
+					continue
+				}
+				ips = append(ips, ip)
+			}
+			sort.Strings(ips)
+			SIPExerPrintf(SIPExerLogInfo, "spread-ips: %s -> %v\n", host, ips)
+		}
+		spreadIPs[host] = ips
+	}
+	spreadIPsMu.Unlock()
+	if len(ips) == 0 {
+		return host
+	}
+	n := atomic.AddUint64(&spreadIPsNext, 1)
+	return ips[(n-1)%uint64(len(ips))]
+}
+
 // SIPExerCallIDOf returns the Call-ID header value of a SIP message ("" if none)
 func SIPExerCallIDOf(b []byte) string {
 	for len(b) > 0 {
@@ -573,6 +610,7 @@ type CLIOptions struct {
 	failovermax      int
 	notifydroppct    float64
 	udpsockets       int
+	spreadips        bool
 	indialogsocket   bool
 	lateoffer        bool
 	akauser          string
@@ -683,6 +721,7 @@ var cliops = CLIOptions{
 	failovermax:      2,
 	notifydroppct:    0,
 	udpsockets:       0,
+	spreadips:        false,
 	indialogsocket:   false,
 	lateoffer:        false,
 	helpcommands:     false,
@@ -886,6 +925,7 @@ func init() {
 	flag.IntVar(&cliops.failovermax, "failover-max", cliops.failovermax, "maximum fail-over copies per transaction")
 	flag.Float64Var(&cliops.notifydroppct, "notify-drop-pct", cliops.notifydroppct, "subscribe-session: percent of dialogs that never answer NOTIFY (phones behind a dead NAT)")
 	flag.IntVar(&cliops.udpsockets, "udp-sockets", cliops.udpsockets, "UDP: share this many local sockets between all dialogs, received packets are routed by Call-ID (0 = one socket per dialog)")
+	flag.BoolVar(&cliops.spreadips, "spread-ips", cliops.spreadips, "UDP: give each new dialog the next IP of the FQDN target in turn, so all A records get the same share (default: the first IP of the DNS answer)")
 	flag.BoolVar(&cliops.indialogsocket, "in-dialog-socket", cliops.indialogsocket, "send each in-dialog request from a new local socket (UDP only)")
 	flag.BoolVar(&cliops.indialogsocket, "ids", cliops.indialogsocket, "send each in-dialog request from a new local socket (UDP only)")
 	flag.BoolVar(&cliops.fieldseval, "fe", cliops.fieldseval, "evaluate expression in fields file")
@@ -4153,7 +4193,11 @@ func SIPExerInitUDPDialog(dstSockAddr sgsip.SGSIPSocketAddress, seDlg *SIPExerDi
 			return SIPExerErrResolveSrcUDPAddr
 		}
 	}
-	seDlg.ConnUDP.DstAddr, err = net.ResolveUDPAddr(strAFProto, dstSockAddr.Addr+":"+dstSockAddr.Port)
+	dstHost := dstSockAddr.Addr
+	if cliops.spreadips {
+		dstHost = SIPExerSpreadIP(strAFProto, dstHost)
+	}
+	seDlg.ConnUDP.DstAddr, err = net.ResolveUDPAddr(strAFProto, dstHost+":"+dstSockAddr.Port)
 	if err != nil {
 		SIPExerPrintf(SIPExerLogError, "error: %v\n", err)
 		return SIPExerErrResolveDstUDPAddr

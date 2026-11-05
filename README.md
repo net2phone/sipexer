@@ -351,6 +351,10 @@ Phone-like behaviour for presence load tests:
   per dialog means one network flow per device, which VPN and endpoint-security agents inspect.
   With a local port in `-laddr`, the sockets use port, port+1, ... Not with `-connect-udp`,
   `-in-dialog-socket` or call-self.
+- `-spread-ips` (UDP, FQDN target): each new dialog gets the next IP of the target name in turn,
+  so every A record (every sipproxy) gets the same share. The name is resolved once per run.
+  Default off: each dialog uses the first IP of the DNS answer, so a cached answer sends a whole
+  block of dialogs to one proxy. `-failover` still moves to the next IP when one does not answer.
 
 Example against a QA pod, many devices from a credentials file (password column in HA1):
 
