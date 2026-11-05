@@ -225,6 +225,7 @@ type SIPExerDialog struct {
 	TargetAFProto  string
 	InitConnUDP    *net.UDPConn
 	InDialogReq    []byte
+	InDialogDNSReq []byte
 
 	LastReply    string
 	LastErr      string
@@ -2926,10 +2927,13 @@ func SIPExerInDialogSocketRestore(seDlg *SIPExerDialog) {
 func SIPExerSendBytes(seDlg *SIPExerDialog, bmsg []byte) int {
 	var err error
 	isReply := bytes.HasPrefix(bmsg, []byte("SIP/2.0 "))
-	// re-resolve DNS for requests only once the dialog is established (2xx received)
-	if cliops.indialogdns && !isReply &&
+	// re-resolve DNS for new requests once the dialog is established; retransmissions keep the target
+	if cliops.indialogdns && !isReply && !bytes.Equal(bmsg, seDlg.InDialogDNSReq) &&
 		(seDlg.State == SIPExerDialogAnswered || seDlg.State == SIPExerDialogConfirmed) {
 		SIPExerResolveDialogTarget(seDlg)
+		seDlg.InDialogDNSReq = append([]byte(nil), bmsg...)
+		// the lookup may outlast the write deadline set by the caller
+		SIPExerSetWriteTimeout(seDlg)
 	}
 	if cliops.indialogsocket && !isReply &&
 		(seDlg.State == SIPExerDialogAnswered || seDlg.State == SIPExerDialogConfirmed) {
