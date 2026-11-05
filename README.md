@@ -345,6 +345,12 @@ Phone-like behaviour for presence load tests:
 - `Retry-After` on an error reply is honoured before the next new `SUBSCRIBE`.
 - `-notify-drop-pct <n>`: that percent of subscribe sessions never answer `NOTIFY`, like
   phones behind a dead NAT mapping.
+- `-udp-sockets <n>` (UDP): share `n` local sockets between all dialogs and route each received
+  packet to its dialog by `Call-ID`. Default 0 keeps one socket per dialog (each device has its
+  own local port). Use a small value (for example 4) to keep the client host light: one socket
+  per dialog means one network flow per device, which VPN and endpoint-security agents inspect.
+  With a local port in `-laddr`, the sockets use port, port+1, ... Not with `-connect-udp`,
+  `-in-dialog-socket` or call-self.
 
 Example against a QA pod, many devices from a credentials file (password column in HA1):
 
