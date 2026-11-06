@@ -225,7 +225,6 @@ type SIPExerDialog struct {
 	TargetAFProto  string
 	InitConnUDP    *net.UDPConn
 	InDialogReq    []byte
-	InDialogDNSReq []byte
 
 	LastReply    string
 	LastErr      string
@@ -868,8 +867,8 @@ func init() {
 	flag.BoolVar(&cliops.contactbuild, "cb", cliops.contactbuild, "build contact header based on local address")
 	flag.BoolVar(&cliops.contactbuild, "contact-build", cliops.contactbuild, "build contact header based on local address")
 	flag.BoolVar(&cliops.dnssrvprint, "dns-srv-print", cliops.dnssrvprint, "print DNS SRV records")
-	flag.BoolVar(&cliops.indialogdns, "in-dialog-dns", cliops.indialogdns, "re-resolve FQDN target via DNS before each in-dialog request (UDP only)")
-	flag.BoolVar(&cliops.indialogdns, "idd", cliops.indialogdns, "re-resolve FQDN target via DNS before each in-dialog request (UDP only)")
+	flag.BoolVar(&cliops.indialogdns, "in-dialog-dns", cliops.indialogdns, "re-resolve FQDN target via DNS before each in-dialog request and retransmission (UDP only)")
+	flag.BoolVar(&cliops.indialogdns, "idd", cliops.indialogdns, "re-resolve FQDN target via DNS before each in-dialog request and retransmission (UDP only)")
 	flag.BoolVar(&cliops.indialogdnsauth, "in-dialog-dns-auth", cliops.indialogdnsauth, "re-resolve FQDN target via DNS before the request with credentials after a 401/407 (UDP only)")
 	flag.BoolVar(&cliops.indialogdnsauth, "idda", cliops.indialogdnsauth, "re-resolve FQDN target via DNS before the request with credentials after a 401/407 (UDP only)")
 	flag.IntVar(&cliops.udpsockets, "udp-sockets", cliops.udpsockets, "UDP: share this many local sockets between all dialogs, received packets are routed by Call-ID (0 = one socket per dialog)")
@@ -3121,11 +3120,10 @@ func SIPExerInDialogSocketRestore(seDlg *SIPExerDialog) {
 func SIPExerSendBytes(seDlg *SIPExerDialog, bmsg []byte) int {
 	var err error
 	isReply := bytes.HasPrefix(bmsg, []byte("SIP/2.0 "))
-	// re-resolve DNS for new requests once the dialog is established; retransmissions keep the target
-	if cliops.indialogdns && !isReply && !bytes.Equal(bmsg, seDlg.InDialogDNSReq) &&
+	// re-resolve DNS before every in-dialog send, so retransmissions spread over the FQDN's IPs
+	if cliops.indialogdns && !isReply &&
 		(seDlg.State == SIPExerDialogAnswered || seDlg.State == SIPExerDialogConfirmed) {
 		SIPExerResolveDialogTarget(seDlg)
-		seDlg.InDialogDNSReq = append([]byte(nil), bmsg...)
 		// the lookup may outlast the write deadline set by the caller
 		SIPExerSetWriteTimeout(seDlg)
 	}
