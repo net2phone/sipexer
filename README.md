@@ -336,6 +336,13 @@ sipexer --subscribe-session --sessionwait 15000 -ex 60 -xh "Event:presence" \
   --fuser alice -cb -sd -su tcp:server.com:5060
 ```
 
+`-udp-sockets <n>` (UDP): share `n` local sockets between all dialogs and route each received
+packet to its dialog by `Call-ID`. Default 0 keeps one socket per dialog (each device has its
+own local port). Use a small value (for example 4) to keep the client host light: one socket
+per dialog means one network flow per device, which VPN and endpoint-security agents inspect.
+With a local port in `-laddr`, the sockets use port, port+1, ... Not with `-connect-udp`,
+`-in-dialog-socket` or call-self.
+
 To remove the default value for implicit fields (e.g., `useragent`), the `-no-val` value can
 be provided (which is default `no`), like:
 
