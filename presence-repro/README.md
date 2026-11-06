@@ -30,6 +30,12 @@ program and the VPN lost up to 110,000 UDP packets a minute, so the test phones 
 
 ## How to reproduce
 
+There are two options. Both make the same load, and both gave the same waves:
+
+* Option 1: Python test phones only (runs 1 and 2).
+* Option 2: sipexer for 100,000 subscriptions and Python test phones for the other 140,000 (run 3).
+  sipexer needs about 100 KB of memory per session, so all 240,000 do not fit well on a 32 GB server.
+
 You need:
 
 * A pod with 2 presence servers and 3 sipproxies (we used QA pod 6071).
@@ -39,15 +45,19 @@ You need:
   secret: never put it in git (`*.secrets.csv` is in `.gitignore`).
 * A login on both presence servers that may run `systemctl restart kamailio` (`ssh/create-tmp-user.sh`),
   with its user and password in `ssh/credential-presence.properties` (copy the `.sample`; never commit it).
+* Option 2 only: Go 1.24, to build sipexer.
 
-Steps:
+First steps, for both options:
 
 1. Prepare the load server once: copy `ssh/setup-loadgen.sh` and `ssh/tune-loadgen.sh` to it, then run
    them there as root: `sudo bash setup-loadgen.sh`, then `sudo bash tune-loadgen.sh`. They make the
    test user and `~/loadgen`, and set bigger UDP buffers and more open files.
 2. Copy `pod-repro/repro.py`, `pod-repro/phones_proxy.py` and the users file to `~/loadgen` on the load
    server, for example with `LOADGEN_HOST=<server ip> ssh/loadgen-login.sh --put <file> loadgen/`.
-3. Start the test phones there: 60,000 phones x 4 subscriptions = 240,000.
+
+### Option 1: Python test phones
+
+3. Start the test phones: 60,000 phones x 4 subscriptions = 240,000.
    ```
    cd ~/loadgen
    python3 -u repro.py --creds <users file> --max-users 60000 --workers 4 --ramp-rate 0 --expires 1333 \
@@ -55,19 +65,52 @@ Steps:
    ```
 4. Wait 25 minutes. Each presence server must get about 100 SUBSCRIBE per second at about 10% CPU
    (see "How to check").
-5. Restart presence-a, then presence-b 21 seconds later. Do nothing else after that:
-   ```
-   ssh/presence-login.sh
-   ssh/presence-login.sh --run presence-6071-a 'sudo -n /usr/bin/systemctl restart kamailio'
-   sleep 21
-   ssh/presence-login.sh --run presence-6071-b 'sudo -n /usr/bin/systemctl restart kamailio'
-   ```
+5. Restart presence (see "Restart presence" below).
 6. Watch presence CPU in Grafana (see "How to check"). Expected: 100% about 15 minutes after the restart,
-   then a new wave to 100% every 20-23 minutes, with 5-28% CPU between waves. The phones stop by
+   then a new wave to 100% every 20-23 minutes, with 5-20% CPU between waves. The phones stop by
    themselves after `--minutes`.
 
-`orchestrator/run_orch.sh` does steps 3-6 by itself (see "Automatic mode"). sipexer can also be the test
-phones (see "Reproduce with sipexer"). Every option is explained in "Parameters".
+### Option 2: sipexer test phones
+
+3. Build sipexer for the load server in the root of this repository, and copy it to `~/loadgen`:
+   `GOOS=linux GOARCH=arm64 go build -o sipexer .`
+4. Start the Python test phones for 140,000 subscriptions (35,000 phones x 4):
+   ```
+   cd ~/loadgen
+   python3 -u repro.py --creds <users file> --max-users 35000 --workers 4 --ramp-rate 0 --expires 1333 \
+     --dead-notify-pct 3 --local-port 5160 --blf-range 1000-99999 --minutes 300 --yes --out runs/test2
+   ```
+5. After 20 minutes, start sipexer for the other 100,000 subscriptions (80 new sessions per second):
+   ```
+   ./sipexer --subscribe-session -sw 7562000 -ex 1333 -cb -ha1 -acsv <users file> \
+     -xh 'Event: dialog' -fd sip.t2-n6071.qa.n2p.io -td sip.t2-n6071.qa.n2p.io \
+     -failover 3500 -rc 100000 -rb 8 -rbi 100 -udp-sockets 16 -spread-ips -vl 1 \
+     -notify-drop-pct 3 -tuser-range 1000-99999
+   ```
+6. Wait until all sessions are made (about 21 minutes). Each presence server must get about 100
+   SUBSCRIBE per second. Then restart presence (see "Restart presence" below).
+7. Watch presence CPU as in option 1. Run 3 had a wave to 100% every 23-24 minutes, with 8-28% CPU
+   between waves.
+
+Notes for option 2:
+
+* `-sw` is how long the sipexer sessions stay up, in milliseconds. 7,562,000 = 21 minutes until the
+  restart + time for 3 waves + 10 minutes. For more waves, add about 23 minutes (1,380,000) per wave.
+* sipexer used 9-12.6 GB of memory for 100,000 sessions. sipexer for all 240,000 would need about 24 GB
+  or more (for example an m7g.4xlarge with 64 GB). This was not tested.
+
+### Restart presence
+
+Restart presence-a, then presence-b 21 seconds later. Do nothing else after that:
+```
+ssh/presence-login.sh
+ssh/presence-login.sh --run presence-6071-a 'sudo -n /usr/bin/systemctl restart kamailio'
+sleep 21
+ssh/presence-login.sh --run presence-6071-b 'sudo -n /usr/bin/systemctl restart kamailio'
+```
+
+`orchestrator/run_orch.sh` does option 1, steps 3-6, by itself (see "Automatic mode"). Every parameter of
+the commands is explained in "Parameters".
 
 ## Result
 
@@ -76,17 +119,20 @@ Load: 240,000 subscriptions, Expires 1333, made evenly, 3% never answer NOTIFY, 
 sent from the AWS server. Trigger: restart presence-a, then presence-b
 20-21 seconds later.
 
-* Run 1: steady load from 18:14, presence restart at 18:39, then 10 waves at 100% CPU on both presence
+* Run 1 (option 1): steady load from 18:14, presence restart at 18:39, then 10 waves at 100% CPU on both presence
   servers from 18:54 to 22:08, one every 20-23 minutes, 5-11% CPU between waves. (Until 18:49 this run also
   had 100,000 extra subscriptions made a few minutes before the restart; the restart removed them and they
   were stopped before their first refresh.)
-* Run 2, a clean repeat from the start: steady load from 22:10, presence restart at 22:35, then 10 waves
+* Run 2 (option 1), a clean repeat from the start: steady load from 22:10, presence restart at 22:35, then 10 waves
   at 100% CPU from 22:51 to 02:02, one every 20-23 minutes, 6-20% CPU between waves.
-* Run 3, with sipexer (100,000 of the 240,000 subscriptions from sipexer, see "Reproduce with sipexer"):
-  presence restart at 03:13 on November 6, then 3 waves at 100% CPU at 03:27, 03:50 and 04:14 (the run was
-  set to stop after 3 waves).
+* Run 3 (option 2, with sipexer): Python phones from 02:31 on November 6, sipexer sessions made from
+  02:51 to 03:13, presence restart at 03:13, then 3 waves at 100% CPU at 03:27, 03:50 and 04:14, one every
+  23-24 minutes, 8-28% CPU between waves (the run was set to stop after 3 waves). After the restart every
+  sipexer refresh got 481 and sipexer opened a new dialog (about 4,800 a minute). In the waves it saw up to
+  15,852 timeouts a minute.
 * The test phones lost no UDP packets (0 UDP errors on the load server in all runs).
-* Chart (presence CPU, November 5 18:20 to November 6 02:05): https://grafana2.aws.net2phone.com/d/kamailio-vlitvinov/kamailio-by-viktor-litvinov?orgId=1&var-datasource=de13w5smkidc0a&var-env=qa&var-node=6071&var-job=n2p-callingserver-presence&var-instance_id=i-002877283156bfa07&var-instance_id=i-04b6ea3a696584676&from=1793920800000&to=1793948700000&viewPanel=29
+* Chart of runs 1 and 2 (presence CPU, November 5 18:20 to November 6 02:05): https://grafana2.aws.net2phone.com/d/kamailio-vlitvinov/kamailio-by-viktor-litvinov?orgId=1&var-datasource=de13w5smkidc0a&var-env=qa&var-node=6071&var-job=n2p-callingserver-presence&var-instance_id=i-002877283156bfa07&var-instance_id=i-04b6ea3a696584676&from=1793920800000&to=1793948700000&viewPanel=29
+* Chart of run 3 (November 6 03:00 to 04:20): https://grafana2.aws.net2phone.com/d/kamailio-vlitvinov/kamailio-by-viktor-litvinov?orgId=1&var-datasource=de13w5smkidc0a&var-env=qa&var-node=6071&var-job=n2p-callingserver-presence&var-instance_id=i-002877283156bfa07&var-instance_id=i-04b6ea3a696584676&from=1793952000000&to=1793956800000&viewPanel=29
 
 Production, node 27, November 3: after the new presence servers started at 01:47 and before the
 first restart by hand at 04:41 (New York time): 8 waves, one every 21-22 minutes, 1-8 minutes at
@@ -186,52 +232,6 @@ REGISTER, MESSAGE, OPTIONS, NOTIFY, KDMQ, INFO, PRACK, ACK, CANCEL), call scenar
 WebSocket, the second user (`-ua2-*`), and print or color options. `-timeout-connect` and
 `-timeout-write` kept their defaults: the first is for TCP and TLS only, the second matters only when a
 socket write blocks (the load server had 0 UDP send errors).
-
-## Reproduce with sipexer
-
-sipexer can be the test phones too. The sipexer run (run 3) used sipexer for 100,000 of the 240,000
-subscriptions and pod-repro for the other 140,000 (35,000 devices x 4), so the total load and the
-shape were the same as runs 1 and 2.
-
-Result of the sipexer run, November 6 (New York time): pod-repro warm-up from 02:31, sipexer sessions made
-from 02:51 to 03:13, presence restart at 03:13 (presence-b 21 seconds after presence-a). Then 3 waves at 100%
-CPU on both presence servers, at 03:27, 03:50 and 04:14 (every 23-24 minutes), with 8-28% CPU between waves.
-The run was set to stop after 3 waves. The sipexer phones took part like the others: after the restart
-every refresh got 481 and sipexer opened a new dialog (about 4,800 per minute), and in the waves it saw up
-to 15,852 timeouts per minute. sipexer used 9-12.6 GB of memory; the load server lost no UDP packets.
-Chart: https://grafana2.aws.net2phone.com/d/kamailio-vlitvinov/kamailio-by-viktor-litvinov?orgId=1&var-datasource=de13w5smkidc0a&var-env=qa&var-node=6071&var-job=n2p-callingserver-presence&var-instance_id=i-002877283156bfa07&var-instance_id=i-04b6ea3a696584676&from=1793952000000&to=1793956800000&viewPanel=29
-
-1. Build sipexer for the load server and copy it next to the users file in `~/loadgen`:
-   `GOOS=linux GOARCH=arm64 go build -o sipexer .` (in the repo root, Go 1.24).
-2. Start pod-repro for 140,000 subscriptions (as in "How to reproduce", step 3, with `--max-users 35000`)
-   and wait 20 minutes.
-3. Start sipexer. The exact command of run 3 (from `~/loadgen`):
-   ```
-   ./sipexer --subscribe-session -sw 7562000 -ex 1333 -cb -ha1 -acsv <users file> \
-     -xh 'Event: dialog' -fd sip.t2-n6071.qa.n2p.io -td sip.t2-n6071.qa.n2p.io \
-     -failover 3500 -rc 100000 -rb 8 -rbi 100 -udp-sockets 16 -spread-ips -vl 1 \
-     -notify-drop-pct 3 -tuser-range 1000-99999
-   ```
-   * `--subscribe-session`: each session keeps one SUBSCRIBE dialog and refreshes it.
-   * `-ex 1333`: Expires 1333 seconds; sipexer refreshes at about 90%, so every 20 minutes.
-   * `-rc 100000 -rb 8 -rbi 100`: 100,000 sessions, 8 new ones every 100 ms (80 per second), so all
-     are made in about 21 minutes and their refreshes are spread evenly over the 20 minutes.
-   * `-sw 7562000`: how long the sessions stay up, in milliseconds (about 2 hours).
-   * `-cb -ha1 -acsv <users file>`: digest login with the HA1 column of the users file.
-   * `-xh 'Event: dialog'`: busy-lamp (dialog) subscriptions.
-   * `-fd` / `-td`: From and To domain of the pod.
-   * `-tuser-range 1000-99999`: each session watches a random extension, spread like production.
-   * `-failover 3500`: no answer in 3.5 seconds: send to the next sipproxy IP, like Polycom phones.
-   * `-spread-ips`: each session uses the next IP of the sipproxy name in turn, so all 3 get traffic.
-   * `-udp-sockets 16`: all sessions share 16 local UDP sockets.
-   * `-notify-drop-pct 3`: 3% of the sessions never answer NOTIFY, like phones behind a broken router.
-   * `-vl 1`: low log level.
-4. When all sessions are made (about 21 minutes), restart presence-a, then presence-b 21 seconds later.
-5. Watch presence CPU as in "How to reproduce", step 6.
-
-Memory: sipexer needs about 100 KB per session. 100,000 sessions used 9-12 GB on the load server
-(more during the waves). 240,000 sessions would need about 24 GB or more, so on a 32 GB server use
-pod-repro for the rest, or use a 64 GB server (for example m7g.4xlarge) for sipexer only.
 
 ## Automatic mode
 
