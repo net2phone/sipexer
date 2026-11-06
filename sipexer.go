@@ -364,6 +364,20 @@ func SIPExerSpreadIP(afProto string, host string) string {
 	return ips[(n-1)%uint64(len(ips))]
 }
 
+// SIPExerTUserRange parses -tuser-range 'lo-hi'
+func SIPExerTUserRange() (int, int, bool) {
+	parts := strings.SplitN(strings.TrimSpace(cliops.tuserrange), "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	lo, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	hi, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || lo < 0 || hi < lo {
+		return 0, 0, false
+	}
+	return lo, hi, true
+}
+
 // SIPExerCallIDOf returns the Call-ID header value of a SIP message ("" if none)
 func SIPExerCallIDOf(b []byte) string {
 	for len(b) > 0 {
@@ -611,6 +625,7 @@ type CLIOptions struct {
 	notifydroppct    float64
 	udpsockets       int
 	spreadips        bool
+	tuserrange       string
 	indialogsocket   bool
 	lateoffer        bool
 	akauser          string
@@ -722,6 +737,7 @@ var cliops = CLIOptions{
 	notifydroppct:    0,
 	udpsockets:       0,
 	spreadips:        false,
+	tuserrange:       "101-125",
 	indialogsocket:   false,
 	lateoffer:        false,
 	helpcommands:     false,
@@ -925,6 +941,7 @@ func init() {
 	flag.IntVar(&cliops.failovermax, "failover-max", cliops.failovermax, "maximum fail-over copies per transaction")
 	flag.Float64Var(&cliops.notifydroppct, "notify-drop-pct", cliops.notifydroppct, "subscribe-session: percent of dialogs that never answer NOTIFY (phones behind a dead NAT)")
 	flag.IntVar(&cliops.udpsockets, "udp-sockets", cliops.udpsockets, "UDP: share this many local sockets between all dialogs, received packets are routed by Call-ID (0 = one socket per dialog)")
+	flag.StringVar(&cliops.tuserrange, "tuser-range", cliops.tuserrange, "subscribe-session without -tuser: each session subscribes to a random To user (and R-URI user, unless -ruser is set) from this numeric range 'lo-hi'; empty = old behaviour")
 	flag.BoolVar(&cliops.spreadips, "spread-ips", cliops.spreadips, "UDP: give each new dialog the next IP of the FQDN target in turn, so all A records get the same share (default: the first IP of the DNS answer)")
 	flag.BoolVar(&cliops.indialogsocket, "in-dialog-socket", cliops.indialogsocket, "send each in-dialog request from a new local socket (UDP only)")
 	flag.BoolVar(&cliops.indialogsocket, "ids", cliops.indialogsocket, "send each in-dialog request from a new local socket (UDP only)")
@@ -1042,6 +1059,12 @@ func main() {
 		SIPExerPrintf(SIPExerLogError, "call-self and in-dialog-socket cannot be enabled at the same time\n")
 		SIPExerExit(SIPExerRetErr)
 	}
+	if cliops.subscribesession && len(cliops.tuser) == 0 && len(cliops.tuserrange) > 0 {
+		if _, _, ok := SIPExerTUserRange(); !ok {
+			SIPExerPrintf(SIPExerLogError, "invalid tuser-range '%s' - expected 'lo-hi', for example 101-125\n", cliops.tuserrange)
+			SIPExerExit(SIPExerRetErr)
+		}
+	}
 	if cliops.udpsockets < 0 {
 		SIPExerPrintf(SIPExerLogError, "udp-sockets cannot be negative\n")
 		SIPExerExit(SIPExerRetErr)
@@ -1134,6 +1157,19 @@ func SIPExerRunScenario(tplstr string, scenarioIndex int) int {
 		target = ac.Target
 	}
 
+	// subscribe-session without -tuser: random To user from -tuser-range, like phones
+	// with BLF keys on different extensions; the R-URI user follows unless -ruser is set
+	rUser := cliops.ruser
+	if cliops.subscribesession && len(cliops.tuser) == 0 && len(cliops.tuserrange) > 0 {
+		if lo, hi, rok := SIPExerTUserRange(); rok {
+			ext := strconv.Itoa(lo + mathrand.Intn(hi-lo+1))
+			tplfields["tuser"] = ext
+			if len(rUser) == 0 {
+				rUser = ext
+			}
+		}
+	}
+
 	var wsurlp *url.URL = nil
 	dstAddr := "udp:127.0.0.1:5060"
 	if len(target) > 0 {
@@ -1187,10 +1223,10 @@ func SIPExerRunScenario(tplstr string, scenarioIndex int) int {
 			if ok {
 				sgsip.SGSocketAddressToSIPURI(&dstSockAddr, fmt.Sprint(tplfields["tuser"]), 0, &dstURI)
 			} else {
-				sgsip.SGSocketAddressToSIPURI(&dstSockAddr, cliops.ruser, 0, &dstURI)
+				sgsip.SGSocketAddressToSIPURI(&dstSockAddr, rUser, 0, &dstURI)
 			}
 		} else {
-			sgsip.SGSocketAddressToSIPURI(&dstSockAddr, cliops.ruser, 0, &dstURI)
+			sgsip.SGSocketAddressToSIPURI(&dstSockAddr, rUser, 0, &dstURI)
 		}
 	}
 	if len(cliops.ruri) > 0 {

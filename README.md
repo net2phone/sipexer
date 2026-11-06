@@ -355,12 +355,16 @@ Phone-like behaviour for presence load tests:
   so every A record (every sipproxy) gets the same share. The name is resolved once per run.
   Default off: each dialog uses the first IP of the DNS answer, so a cached answer sends a whole
   block of dialogs to one proxy. `-failover` still moves to the next IP when one does not answer.
+- `-tuser-range lo-hi` (subscribe-session, default `101-125`): when `-tuser` is not set, each
+  session subscribes to a random extension from the range, like phones with BLF keys on
+  different extensions. The R-URI user is the same extension unless `-ruser` is set. Set
+  `-tuser-range ''` for the old behaviour.
 
 Example against a QA pod, many devices from a credentials file (password column in HA1):
 
 ```shell
 sipexer --subscribe-session -sw 1800000 -ex 600 -cb -ha1 -acsv users.csv \
-  -xh 'Event: dialog' -tuser 101 -ruser 101 -fd sip.t2-n6071.qa.n2p.io -td sip.t2-n6071.qa.n2p.io \
+  -xh 'Event: dialog' -fd sip.t2-n6071.qa.n2p.io -td sip.t2-n6071.qa.n2p.io \
   -failover 3500 -notify-drop-pct 2 -rc 30000 -rb 200 -rbi 1000
 ```
 
